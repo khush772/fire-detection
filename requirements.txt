@@ -1,4 +1,5 @@
-   ultralytics
-   streamlit
-   opencv-python
-   pandas
+ultralytics
+opencv-python-headless
+numpy
+pandas
+requests
