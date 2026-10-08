@@ -43,6 +43,9 @@ except OSError:
 
 st.set_page_config(page_title="Fire Detection", page_icon="🔥", layout="wide")
 
+# Streamlit Community Cloud runs apps from /mount/src; a server has no webcam.
+ON_CLOUD = os.path.exists("/mount/src")
+
 # Newer Streamlit uses width="stretch"; older uses use_container_width=True.
 _ver = tuple(int(x) for x in re.findall(r"\d+", st.__version__)[:2])
 STRETCH = {"width": "stretch"} if _ver >= (1, 50) else {"use_container_width": True}
@@ -160,7 +163,14 @@ with st.sidebar:
         st.stop()
 
     st.header("Source")
-    source = st.radio("Input", ["Webcam", "Image", "Video file"], horizontal=True, label_visibility="collapsed")
+    source = st.radio(
+        "Input",
+        ["Browser camera", "Webcam", "Image", "Video file"],
+        index=0 if ON_CLOUD else 1,
+        horizontal=True,
+        label_visibility="collapsed",
+        help="Browser camera works everywhere (online or local). Webcam only works when the app runs on your own computer.",
+    )
     cam_index, res = 0, "1280x720"
     if source == "Webcam":
         cam_index = st.number_input("Camera number (0 = first camera)", 0, 10, 0)
@@ -205,7 +215,7 @@ with st.sidebar:
     test_sound = st.button("Test siren", **STRETCH)
 
     snap = record = False
-    if source != "Image":
+    if source not in ("Image", "Browser camera"):
         st.header("Output")
         record = st.toggle("Record video to file")
         snap = st.button("Save snapshot", **STRETCH)
@@ -552,10 +562,13 @@ if test_tg:
 
 # --------------------------------------------------------------------- modes
 live = False
-if source == "Image":
-    up = left.file_uploader("Choose an image", type=["jpg", "jpeg", "png", "bmp", "webp"])
+if source in ("Image", "Browser camera"):
+    if source == "Image":
+        up = left.file_uploader("Choose an image", type=["jpg", "jpeg", "png", "bmp", "webp"])
+    else:
+        up = left.camera_input("Take a photo to check for fire", help="Allow camera access in your browser when asked.")
     if up:
-        frame = cv2.imdecode(np.frombuffer(up.read(), np.uint8), cv2.IMREAD_COLOR)
+        frame = cv2.imdecode(np.frombuffer(up.getvalue(), np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             st.error("That file could not be read as an image.")
         else:
@@ -571,7 +584,8 @@ if source == "Image":
             if ok:
                 left.download_button("Download result", buf.tobytes(), "detected.png", "image/png")
     else:
-        idle("Upload an image to see detections.")
+        idle("Upload an image to see detections." if source == "Image"
+             else "Press <b>Take photo</b> below. The photo is checked for fire straight away.")
 else:
     cap = None
     if source == "Webcam":
@@ -597,8 +611,16 @@ else:
         render_tables(True)
     elif not cap.isOpened():
         cap.release()
-        pill_slot.markdown('<span class="pill err">Error</span>', unsafe_allow_html=True)
-        st.error("Couldn't open the source. Try another camera number and close apps that use the webcam.")
+        pill_slot.markdown('<span class="pill err">No camera</span>', unsafe_allow_html=True)
+        idle("No camera found here.")
+        if source == "Webcam":
+            st.warning(
+                "No webcam could be opened. If you are using the online version, the server has no camera: "
+                "choose **Browser camera**, **Image** or **Video file** in the sidebar. "
+                "On your own PC, try another camera number and close other apps that use the webcam."
+            )
+        else:
+            st.error("That video could not be opened. Try an .mp4 file.")
         render_tables(True)
     else:
         live = True
@@ -656,7 +678,7 @@ else:
         draw_charts()
         render_tables(True)
 
-if source == "Image":
+if source in ("Image", "Browser camera"):
     render_tables(True)
 
 st.markdown(
