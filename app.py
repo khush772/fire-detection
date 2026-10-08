@@ -3,7 +3,7 @@ Fire Detection
 Real-time fire & smoke detection with a professional dashboard look.
 
 Run:   streamlit run fire_detection_app.py
-Needs: pip install streamlit ultralytics opencv-python numpy pandas requests
+Needs: pip install streamlit ultralytics opencv-python numpy pandas requests streamlit-webrtc
 """
 import glob
 import io
@@ -22,6 +22,14 @@ import pandas as pd
 import requests
 import streamlit as st
 from ultralytics import YOLO
+
+try:  # continuous live video from the visitor's browser camera
+    import av
+    from streamlit_webrtc import WebRtcMode, webrtc_streamer
+
+    HAS_RTC = True
+except Exception:
+    HAS_RTC = False
 
 # ---------------------------------------------------------------- theme file
 THEME = """[theme]
@@ -165,11 +173,11 @@ with st.sidebar:
     st.header("Source")
     source = st.radio(
         "Input",
-        ["Browser camera", "Webcam", "Image", "Video file"],
-        index=0 if ON_CLOUD else 1,
+        ["Live camera (browser)", "Browser photo", "Webcam", "Image", "Video file"],
+        index=0 if ON_CLOUD else 2,
         horizontal=True,
         label_visibility="collapsed",
-        help="Browser camera works everywhere (online or local). Webcam only works when the app runs on your own computer.",
+        help="Live camera streams your browser camera and detects continuously (works online). Browser photo takes one picture at a time. Webcam only works when the app runs on your own computer.",
     )
     cam_index, res = 0, "1280x720"
     if source == "Webcam":
@@ -215,7 +223,7 @@ with st.sidebar:
     test_sound = st.button("Test siren", **STRETCH)
 
     snap = record = False
-    if source not in ("Image", "Browser camera"):
+    if source not in ("Image", "Browser photo", "Live camera (browser)"):
         st.header("Output")
         record = st.toggle("Record video to file")
         snap = st.button("Save snapshot", **STRETCH)
@@ -448,6 +456,55 @@ def tg_test():
         st.toast(f"Telegram failed: {e}")
 
 
+# ------------------------------------------------------------ live camera (WebRTC)
+class LiveShared:
+    """State shared between the video thread and the Streamlit script."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cfg = {}
+        self.result = None
+        self.counter = 0
+
+
+@st.cache_resource
+def get_live_shared():
+    return LiveShared()
+
+
+live_shared = get_live_shared()
+live_shared.cfg = dict(conf=conf, iou=iou, classes=class_ids, imgsz=min(imgsz, 640),
+                       labels=show_labels, show_conf=show_conf, width=thickness)
+
+
+def live_callback(frame):
+    """Runs in a background thread for every video frame: detect, draw, hand results to the page."""
+    img = frame.to_ndarray(format="bgr24")
+    c = live_shared.cfg
+    try:
+        r = model(img, conf=c["conf"], iou=c["iou"], classes=c["classes"], imgsz=c["imgsz"], verbose=False)[0]
+        out = r.plot(labels=c["labels"], conf=c["show_conf"], line_width=c["width"])
+        names = [model.names[int(k)] for k in r.boxes.cls.tolist()]
+        confs, boxes = r.boxes.conf.tolist(), r.boxes.xyxy.tolist()
+    except Exception:
+        out, names, confs, boxes = img, [], [], []
+    with live_shared.lock:
+        live_shared.counter += 1
+        live_shared.result = {"id": live_shared.counter, "img": out, "names": names,
+                              "confs": confs, "boxes": boxes, "shape": img.shape}
+    return av.VideoFrame.from_ndarray(out, format="bgr24")
+
+
+def rtc_config():
+    servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
+    try:  # optional TURN relay for strict networks: add [turn] url/username/credential to Streamlit secrets
+        t = st.secrets["turn"]
+        servers.append({"urls": [t["url"]], "username": t["username"], "credential": t["credential"]})
+    except Exception:
+        pass
+    return {"iceServers": servers}
+
+
 # -------------------------------------------------------------------- layout
 st.markdown(
     '<div class="hero"><div class="nav">'
@@ -562,7 +619,65 @@ if test_tg:
 
 # --------------------------------------------------------------------- modes
 live = False
-if source in ("Image", "Browser camera"):
+if source == "Live camera (browser)":
+    if not HAS_RTC:
+        idle("Live camera needs the <b>streamlit-webrtc</b> package.")
+        st.error("Add `streamlit-webrtc` to requirements.txt (on your PC: pip install streamlit-webrtc) and restart.")
+        render_tables(True)
+    else:
+        with frame_slot.container():
+            ctx = webrtc_streamer(
+                key="fire-live",
+                mode=WebRtcMode.SENDRECV,
+                rtc_configuration=rtc_config(),
+                video_frame_callback=live_callback,
+                media_stream_constraints={
+                    "video": {"width": {"ideal": 640}, "height": {"ideal": 480}, "frameRate": {"ideal": 15}},
+                    "audio": False,
+                },
+                async_processing=True,
+            )
+        left.caption("Press START and allow camera access. Detection runs on the live video. "
+                     "If it stays on 'connecting', try another network or use Browser photo.")
+        if ctx.state.playing:
+            live = True
+            pill_slot.markdown('<span class="pill live">● Live</span>', unsafe_allow_html=True)
+            render_tables(False)
+            hb = st.empty()
+            with live_shared.lock:
+                last_id = live_shared.result["id"] if live_shared.result else 0
+            n, prev = 0, time.time()
+            try:
+                while ctx.state.playing:
+                    hb.empty()  # keeps the page responsive to widget changes
+                    with live_shared.lock:
+                        res = live_shared.result
+                    if res is None or res["id"] == last_id:
+                        time.sleep(0.05)
+                        continue
+                    last_id = res["id"]
+                    names, confs = res["names"], res["confs"]
+                    score, area_pct = analyse(names, confs, res["boxes"], res["shape"])
+                    lvl, _ = level_of(score)
+                    remember(names, confs, score)
+                    check_alarm(names, confs, res["img"], alarm_state, hold_secs, lvl)
+                    n += 1
+                    if n % 5 == 0:
+                        now = time.time()
+                        paint(5 / max(now - prev, 1e-6), names, score, area_pct)
+                        prev = now
+                    if n % 15 == 0:
+                        draw_charts()
+                    if n % 30 == 0:
+                        render_tables(False)
+            except Exception as e:
+                st.error(f"Live detection stopped: {e}")
+            pill_slot.markdown('<span class="pill">Stopped</span>', unsafe_allow_html=True)
+            draw_charts()
+            render_tables(True)
+        else:
+            render_tables(True)
+elif source in ("Image", "Browser photo"):
     if source == "Image":
         up = left.file_uploader("Choose an image", type=["jpg", "jpeg", "png", "bmp", "webp"])
     else:
@@ -616,7 +731,7 @@ else:
         if source == "Webcam":
             st.warning(
                 "No webcam could be opened. If you are using the online version, the server has no camera: "
-                "choose **Browser camera**, **Image** or **Video file** in the sidebar. "
+                "choose **Live camera (browser)**, **Browser photo**, **Image** or **Video file** in the sidebar. "
                 "On your own PC, try another camera number and close other apps that use the webcam."
             )
         else:
@@ -678,7 +793,7 @@ else:
         draw_charts()
         render_tables(True)
 
-if source in ("Image", "Browser camera"):
+if source in ("Image", "Browser photo"):
     render_tables(True)
 
 st.markdown(
